@@ -1,4 +1,4 @@
-const CACHE_NAME = 'genzebe-cache-v1';
+const CACHE_NAME = 'genzebe-cache-v2';
 const ASSETS = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -17,8 +17,18 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
+// Network-first: always try to get the freshest copy when online (so pushed
+// updates show up immediately), and only fall back to the cached copy when
+// there's no connection. The old cache-first version served stale content
+// indefinitely after every deploy, which is what caused this exact bug.
 self.addEventListener('fetch', (event) => {
   event.respondWith(
-    caches.match(event.request).then((cached) => cached || fetch(event.request))
+    fetch(event.request)
+      .then((response) => {
+        const responseClone = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, responseClone));
+        return response;
+      })
+      .catch(() => caches.match(event.request))
   );
 });
