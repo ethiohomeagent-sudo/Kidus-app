@@ -1,6 +1,6 @@
 {
-  "name": "Genzebe - ገንዘቤ",
-  "short_name": "Genzebe",
+  "name": "Kidus Expenses - የቅዱስ ወጪ",
+  "short_name": "Kidus",
   "description": "Offline income and expense tracker",
   "start_url": "./index.html",
   "scope": "./",
