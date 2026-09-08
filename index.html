@@ -441,7 +441,7 @@
     document.getElementById('syncModal').addEventListener('click', (e) => {
         if (e.target.id === 'syncModal') document.getElementById('syncModal').classList.remove('open');
     });
-    document.getElementById('syncModalSave').addEventListener('click', () => {
+    document.getElementById('syncModalSave').addEventListener('click', async () => {
         const url = document.getElementById('syncUrlInput').value.trim();
         const secret = document.getElementById('syncSecretInput').value.trim();
         document.getElementById('syncModal').classList.remove('open');
@@ -454,7 +454,23 @@
         }
         syncConfig = { url, secret };
         safeSetItem(SYNC_CONFIG_KEY, JSON.stringify(syncConfig));
-        pullFromSheet();
+
+        // Critical: push everything already sitting locally BEFORE the first pull.
+        // Otherwise a pull against an empty/older sheet would treat the sheet as
+        // authoritative and silently drop local-only entries that were never
+        // uploaded in the first place.
+        setSyncStatus(lang === 'am' ? 'የመጀመሪያ ውሂብ በመላክ ላይ...' : 'Uploading existing data...', 'syncing');
+        transactions.forEach(t => {
+            syncQueue.push({
+                action: 'upsert',
+                payload: { id: t.id, type: t.type, amount: t.amount, desc: t.desc, cat: t.cat, date: t.date },
+                ts: Date.now()
+            });
+        });
+        persistSyncQueue();
+        await flushSyncQueue();
+        await pullFromSheet();
+
         if (!window.__syncPollingStarted) {
             window.__syncPollingStarted = true;
             setInterval(() => { flushSyncQueue(); pullFromSheet(); }, SYNC_POLL_INTERVAL_MS);
