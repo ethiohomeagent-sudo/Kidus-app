@@ -10,7 +10,7 @@
     <link rel="apple-touch-icon" href="icon-192.png">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
-    <meta name="apple-mobile-web-app-title" content="Genzebe">
+    <meta name="apple-mobile-web-app-title" content="Kidus Expenses">
     <style>
         :root {
             --primary: #059669; --primary-dark: #047857;
@@ -75,6 +75,14 @@
         .modal-cancel { background: #e5e7eb; color: #374151; }
         .modal-confirm { background: var(--danger); color: white; }
         .modal-confirm:hover { background: var(--danger-dark); }
+
+        .sync-btn { background: none; border: none; color: white; cursor: pointer; font-size: 1.1rem; padding: 4px 6px; width: auto; margin: 0; }
+        .sync-status { font-size: 0.75rem; text-align: center; padding: 6px 20px; color: #6b7280; background: #f9fafb; border-bottom: 1px solid #e5e7eb; }
+        .sync-status.ok { color: var(--primary-dark); }
+        .sync-status.error { color: var(--danger-dark); }
+        .sync-status.syncing { color: var(--warn); }
+        .modal-box .sync-field-label { font-size: 0.8rem; color: #4b5563; font-weight: bold; margin-bottom: 4px; }
+        .modal-box .sync-help { font-size: 0.75rem; color: #6b7280; margin: -6px 0 12px 0; }
     </style>
 </head>
 <body>
@@ -82,8 +90,12 @@
 <div class="app-container">
     <div class="header">
         <h1 id="appTitle">የቅዱስ ወጪ (Kidus Expenses)</h1>
-        <button class="lang-btn" id="langToggle">EN</button>
+        <div style="display:flex; align-items:center; gap: 6px;">
+            <button class="sync-btn" id="syncSettingsBtn" title="Sync settings">⚙️</button>
+            <button class="lang-btn" id="langToggle">EN</button>
+        </div>
     </div>
+    <div class="sync-status" id="syncStatus"></div>
 
     <div class="dashboard">
         <div style="font-size: 0.9rem; color: #065f46;" id="lblBalance">ቀሪ ሂሳብ / Balance</div>
@@ -141,6 +153,24 @@
     </div>
 </div>
 
+<div class="modal-overlay" id="syncModal">
+    <div class="modal-box">
+        <p style="font-weight:bold; margin-bottom: 14px;" id="syncModalTitle">Google Sheet Sync</p>
+
+        <div class="sync-field-label" id="lblSyncUrl">Web App URL</div>
+        <input type="url" id="syncUrlInput" placeholder="https://script.google.com/macros/s/.../exec">
+
+        <div class="sync-field-label" id="lblSyncSecret">Secret Key</div>
+        <input type="text" id="syncSecretInput" placeholder="The SECRET you set in the script">
+        <div class="sync-help" id="syncHelpText">Both values come from your Apps Script deployment. Leave blank and save to turn sync off.</div>
+
+        <div class="modal-actions">
+            <button type="button" class="modal-cancel" id="syncModalClose">Close</button>
+            <button type="button" class="modal-confirm" id="syncModalSave" style="background: var(--primary);">Save & Sync Now</button>
+        </div>
+    </div>
+</div>
+
 <script>
 (function () {
     'use strict';
@@ -152,11 +182,19 @@
     const RECEIPT_MAX_DIMENSION = 800;                 // px, longest side after downscale
     const RECEIPT_JPEG_QUALITY = 0.6;
 
+    const SYNC_CONFIG_KEY = 'genzebe_sync_config';   // { url, secret }
+    const SYNC_QUEUE_KEY = 'genzebe_sync_queue';     // pending writes not yet confirmed on the sheet
+    const SYNC_POLL_INTERVAL_MS = 25000;             // how often to re-pull while the app is open
+
     let transactions = safeLoadTransactions();
     let currentType = 'expense';
     let lang = safeLoadLang();
+    let syncConfig = safeLoadSyncConfig();
+    let syncQueue = safeLoadSyncQueue();
+    let syncInFlight = false;
 
     const UI = {
+        appTitle: { am: 'የቅዱስ ወጪ (Kidus Expenses)', en: 'Kidus Expenses' },
         lblBalance: { am: 'ጠቅላላ ቀሪ ሂሳብ', en: 'Total Balance' },
         lblIncome: { am: 'ጠቅላላ ገቢ', en: 'Income' },
         lblExpense: { am: 'ጠቅላላ ወጪ', en: 'Expense' },
@@ -240,6 +278,188 @@
     function persistTransactions() {
         return safeSetItem(STORAGE_KEY, JSON.stringify(transactions));
     }
+
+    // ---- Google Sheet sync -------------------------------------------------
+    function safeLoadSyncConfig() {
+        try {
+            const raw = safeGetItem(SYNC_CONFIG_KEY);
+            const parsed = raw ? JSON.parse(raw) : null;
+            if (parsed && parsed.url && parsed.secret) return parsed;
+        } catch (err) { /* fall through */ }
+        return null;
+    }
+
+    function safeLoadSyncQueue() {
+        try {
+            const raw = safeGetItem(SYNC_QUEUE_KEY);
+            const parsed = raw ? JSON.parse(raw) : [];
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (err) {
+            return [];
+        }
+    }
+
+    function persistSyncQueue() {
+        safeSetItem(SYNC_QUEUE_KEY, JSON.stringify(syncQueue));
+    }
+
+    function setSyncStatus(text, kind) {
+        const el = document.getElementById('syncStatus');
+        if (!el) return;
+        if (!text) { el.style.display = 'none'; return; }
+        el.style.display = 'block';
+        el.textContent = text;
+        el.className = 'sync-status' + (kind ? ' ' + kind : '');
+    }
+
+    function refreshSyncStatusIdle() {
+        if (!syncConfig) { setSyncStatus('', null); return; }
+        const pendingCount = syncQueue.length;
+        if (pendingCount > 0) {
+            setSyncStatus(
+                (lang === 'am' ? 'ያልተላከ: ' : 'Pending sync: ') + pendingCount,
+                'syncing'
+            );
+        } else {
+            const stamp = safeGetItem('genzebe_last_synced');
+            setSyncStatus(
+                (lang === 'am' ? 'ሁሉም ተመሳስሏል' : 'All synced') + (stamp ? ' · ' + stamp : ''),
+                'ok'
+            );
+        }
+    }
+
+    // Queue a write (upsert or delete) so it survives being offline, then try to send it.
+    function queueSyncWrite(action, payload) {
+        if (!syncConfig) return; // sync not configured, nothing to do
+        syncQueue.push({ action, payload, ts: Date.now() });
+        persistSyncQueue();
+        refreshSyncStatusIdle();
+        flushSyncQueue();
+    }
+
+    async function flushSyncQueue() {
+        if (!syncConfig || syncInFlight || syncQueue.length === 0) return;
+        if (!navigator.onLine) { refreshSyncStatusIdle(); return; }
+
+        syncInFlight = true;
+        setSyncStatus(lang === 'am' ? 'በማመሳሰል ላይ...' : 'Syncing...', 'syncing');
+
+        while (syncQueue.length > 0) {
+            const item = syncQueue[0];
+            try {
+                const body = item.action === 'upsert'
+                    ? { secret: syncConfig.secret, action: 'upsert', transaction: item.payload }
+                    : { secret: syncConfig.secret, action: 'delete', id: item.payload };
+
+                const res = await fetch(syncConfig.url, {
+                    method: 'POST',
+                    // text/plain avoids a CORS preflight that Apps Script web apps don't handle.
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    body: JSON.stringify(body)
+                });
+                const json = await res.json();
+                if (json.error) throw new Error(json.error);
+
+                syncQueue.shift();
+                persistSyncQueue();
+            } catch (err) {
+                console.warn('Sync push failed, will retry later:', err);
+                break; // stop draining the queue, keep failed item at the front for next attempt
+            }
+        }
+
+        syncInFlight = false;
+        safeSetItem('genzebe_last_synced', new Date().toLocaleTimeString());
+        refreshSyncStatusIdle();
+    }
+
+    // Pull the latest rows from the sheet and reconcile with local state.
+    // The sheet is treated as the source of truth, except for writes still
+    // sitting in the local queue (not yet confirmed) — those are kept so an
+    // in-flight edit is never clobbered by a pull that raced ahead of it.
+    async function pullFromSheet() {
+        if (!syncConfig || syncInFlight) return;
+        if (!navigator.onLine) { refreshSyncStatusIdle(); return; }
+
+        try {
+            setSyncStatus(lang === 'am' ? 'በማመሳሰል ላይ...' : 'Syncing...', 'syncing');
+            const url = syncConfig.url + '?secret=' + encodeURIComponent(syncConfig.secret);
+            const res = await fetch(url);
+            const json = await res.json();
+            if (json.error) throw new Error(json.error);
+
+            const remote = Array.isArray(json.transactions) ? json.transactions : [];
+            const queuedIds = new Set(
+                syncQueue.filter(q => q.action === 'upsert').map(q => String(q.payload.id))
+            );
+            const queuedDeletes = new Set(
+                syncQueue.filter(q => q.action === 'delete').map(q => String(q.payload))
+            );
+
+            // Preserve local-only receipt images: the sheet never stores them.
+            const localReceiptById = new Map(transactions.map(t => [String(t.id), t.receipt]));
+
+            const merged = remote
+                .filter(r => !queuedDeletes.has(String(r.id)))
+                .map(r => ({ ...r, receipt: localReceiptById.get(String(r.id)) || null }));
+
+            // Re-add anything still pending upload so it doesn't disappear mid-sync.
+            transactions.forEach(t => {
+                if (queuedIds.has(String(t.id)) && !merged.some(m => String(m.id) === String(t.id))) {
+                    merged.unshift(t);
+                }
+            });
+
+            transactions = merged;
+            persistTransactions();
+            renderUI();
+            safeSetItem('genzebe_last_synced', new Date().toLocaleTimeString());
+            refreshSyncStatusIdle();
+        } catch (err) {
+            console.warn('Sync pull failed:', err);
+            setSyncStatus(lang === 'am' ? 'የማመሳሰል ስህተት' : 'Sync error — will retry', 'error');
+        }
+    }
+
+    function startSyncPolling() {
+        if (!syncConfig) return;
+        pullFromSheet();
+        setInterval(() => { flushSyncQueue(); pullFromSheet(); }, SYNC_POLL_INTERVAL_MS);
+    }
+
+    window.addEventListener('online', () => { flushSyncQueue(); pullFromSheet(); });
+
+    document.getElementById('syncSettingsBtn').addEventListener('click', () => {
+        document.getElementById('syncUrlInput').value = syncConfig ? syncConfig.url : '';
+        document.getElementById('syncSecretInput').value = syncConfig ? syncConfig.secret : '';
+        document.getElementById('syncModal').classList.add('open');
+    });
+    document.getElementById('syncModalClose').addEventListener('click', () => {
+        document.getElementById('syncModal').classList.remove('open');
+    });
+    document.getElementById('syncModal').addEventListener('click', (e) => {
+        if (e.target.id === 'syncModal') document.getElementById('syncModal').classList.remove('open');
+    });
+    document.getElementById('syncModalSave').addEventListener('click', () => {
+        const url = document.getElementById('syncUrlInput').value.trim();
+        const secret = document.getElementById('syncSecretInput').value.trim();
+        document.getElementById('syncModal').classList.remove('open');
+
+        if (!url || !secret) {
+            syncConfig = null;
+            safeSetItem(SYNC_CONFIG_KEY, '');
+            setSyncStatus('', null);
+            return;
+        }
+        syncConfig = { url, secret };
+        safeSetItem(SYNC_CONFIG_KEY, JSON.stringify(syncConfig));
+        pullFromSheet();
+        if (!window.__syncPollingStarted) {
+            window.__syncPollingStarted = true;
+            setInterval(() => { flushSyncQueue(); pullFromSheet(); }, SYNC_POLL_INTERVAL_MS);
+        }
+    });
 
     // ---- XSS-safe rendering ---------------------------------------------
     function escapeHtml(str) {
@@ -405,6 +625,17 @@
 
         document.getElementById('txForm').reset();
         renderUI();
+
+        // Sheet sync intentionally excludes the receipt image (spreadsheets
+        // aren't built for embedded binary blobs) — only the fields below sync.
+        queueSyncWrite('upsert', {
+            id: transactions[0].id,
+            type: transactions[0].type,
+            amount: transactions[0].amount,
+            desc: transactions[0].desc,
+            cat: transactions[0].cat,
+            date: transactions[0].date
+        });
         return true;
     }
 
@@ -508,10 +739,16 @@
             showBanner(MSG.quotaExceeded[lang], 'warn');
         }
         renderUI();
+        queueSyncWrite('delete', id);
     };
 
     updateLang();
     renderUI();
+    refreshSyncStatusIdle();
+    if (syncConfig) {
+        window.__syncPollingStarted = true;
+        startSyncPolling();
+    }
 
     if ('serviceWorker' in navigator) {
         window.addEventListener('load', () => {
